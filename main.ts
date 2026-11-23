@@ -62,6 +62,15 @@ class Tree {
   get(p: string): string | null {
     return this.now.has(p) ? this.now.get(p)! : this.original(p);
   }
+  exists(p: string): boolean {
+    if (this.now.has(p)) return this.now.get(p) !== null;
+    try {
+      statSync(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 type Edit = (tree: Tree) => void;
@@ -232,7 +241,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
-      if (tree.get(p) !== null) throw new Fail('exists', p);
+      if (tree.exists(p)) throw new Fail('exists', p);
       tree.now.set(p, text);
     };
   }
@@ -497,7 +506,7 @@ function sectionEdit(sec: Section, strict: boolean): Edit {
     const content = plusLines.length === 0 ? '' : plusLines.join('\n') + (noEol ? '' : '\n');
     return (tree) => {
       if (!safe(newP)) throw new Fail('unsafe', newP);
-      if (tree.get(newP) !== null) throw new Fail('exists', newP);
+      if (tree.exists(newP)) throw new Fail('exists', newP);
       tree.now.set(newP, content);
     };
   }
@@ -517,7 +526,7 @@ function sectionEdit(sec: Section, strict: boolean): Edit {
       if (!safe(newP)) throw new Fail('unsafe', newP);
       const before = tree.get(oldP);
       if (before === null) throw new Fail('missing', oldP);
-      if (tree.get(newP) !== null) throw new Fail('exists', newP);
+      if (tree.exists(newP)) throw new Fail('exists', newP);
       const result = applyHunks(before, sec.hunks, strict, oldP);
       tree.now.set(oldP, null);
       tree.now.set(newP, result);
@@ -624,7 +633,7 @@ function srEdit(path: string, oldLines: string[], newLines: string[], strict: bo
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
     if (oldLines.length === 0) {
-      if (tree.get(path) !== null) throw new Fail('exists', path);
+      if (tree.exists(path)) throw new Fail('exists', path);
       tree.now.set(path, newLines.length === 0 ? '' : newLines.join('\n') + '\n');
       return;
     }
@@ -690,22 +699,28 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
       const path = l.slice('*** Add File: '.length).trim();
       i++;
       const collected: string[] = [];
+      const fromPlus: boolean[] = [];
       while (i < last) {
         const cl = lines[i]!;
         if (isV4aSectionStart(cl) || isV4aEndPatch(cl)) break;
         if (cl.startsWith('+')) {
           collected.push(cl.slice(1));
+          fromPlus.push(true);
           i++;
           continue;
         }
         if (blank(cl)) {
           collected.push('');
+          fromPlus.push(false);
           i++;
           continue;
         }
         throw new Exit2(`error: parse ${i + 1}`);
       }
-      while (collected.length > 0 && collected[collected.length - 1] === '') collected.pop();
+      while (collected.length > 0 && collected[collected.length - 1] === '' && !fromPlus[fromPlus.length - 1]) {
+        collected.pop();
+        fromPlus.pop();
+      }
       edits.push(v4aAddEdit(path, collected));
       continue;
     }
@@ -797,7 +812,7 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
 function v4aAddEdit(path: string, lines: string[]): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
-    if (tree.get(path) !== null) throw new Fail('exists', path);
+    if (tree.exists(path)) throw new Fail('exists', path);
     tree.now.set(path, lines.length === 0 ? '' : lines.join('\n') + '\n');
   };
 }
