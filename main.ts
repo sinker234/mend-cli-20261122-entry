@@ -563,7 +563,12 @@ function parseUnified(lines: string[], strict: boolean): Edit[] {
       i = parseSectionHunks(lines, i, sec);
       sections.push(sec);
     } else if (l.startsWith('@@')) {
-      throw new Exit2(`error: parse ${i + 1}`);
+      if (sections.length === 0) throw new Exit2(`error: parse ${i + 1}`);
+      // A hunk after a section whose hunks ended: prose between two hunks of
+      // the same section is ignored (SPEC 6: outside bodies, lines that are
+      // not part of a section header are ignored), so this hunk still belongs
+      // to that section — keep parsing hunks into it instead of throwing.
+      i = parseSectionHunks(lines, i, sections[sections.length - 1]!);
     } else if (l.startsWith('diff --git')) {
       throw new Exit2(`error: parse ${i + 1}`);
     } else {
@@ -747,11 +752,19 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
       const chunks: V4aChunk[] = [];
       let cur: V4aChunk | null = null;
       let seenContent = false;
+      // Blank lines seen before the first chunk: held, not dropped — per SPEC 8
+      // they are empty context lines of the first chunk, flushed into its body
+      // when real chunk content arrives. They belong to no chunk when what
+      // follows shows that (*** Move to: as the section's first line, an @@
+      // chunk whose body starts after its header, or the end of the section),
+      // so they are discarded there instead.
+      let pendingBlanks: string[] = [];
       while (i < last) {
         const cl = lines[i]!;
         if (isV4aSectionStart(cl) || isV4aEndPatch(cl)) break;
         if (!seenContent && cl.startsWith('*** Move to: ')) {
           moveTo = cl.slice('*** Move to: '.length).trim();
+          pendingBlanks = [];
           seenContent = true;
           i++;
           continue;
@@ -767,6 +780,7 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
         }
         if (cl.startsWith('@@')) {
           const anchor = cl.slice(2).trim();
+          pendingBlanks = [];
           cur = { anchor: anchor === '' ? null : anchor, eof: false, body: [], O: [], N: [] };
           chunks.push(cur);
           seenContent = true;
@@ -775,13 +789,23 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
         }
         if (cl.startsWith(' ') || cl.startsWith('-') || cl.startsWith('+') || blank(cl)) {
           if (cur === null) {
+            if (blank(cl) && chunks.length > 0) {
+              i++;
+              continue;
+            }
             if (blank(cl)) {
+              // Before the first chunk: an empty context line, not a skipped
+              // line (SPEC 8). Hold it until the first chunk starts.
+              pendingBlanks.push(cl);
               i++;
               continue;
             }
             if (chunks.length > 0) throw new Exit2(`error: parse ${i + 1}`);
             cur = { anchor: null, eof: false, body: [], O: [], N: [] };
             chunks.push(cur);
+            // Leading blank lines are the first chunk's empty context lines.
+            for (const b of pendingBlanks) cur.body.push(b);
+            pendingBlanks = [];
           }
           cur.body.push(cl);
           seenContent = true;
@@ -793,7 +817,12 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
       if (chunks.length === 0 && moveTo === null) throw new Exit2(`error: parse ${updateLine}`);
       if (chunks.length > 0) {
         const lastChunk = chunks[chunks.length - 1]!;
-        while (lastChunk.body.length > 0 && blank(lastChunk.body[lastChunk.body.length - 1]!)) lastChunk.body.pop();
+        // Blank lines at the end of a section (before the next section or
+        // *** End Patch) are not part of it (SPEC 8); blanks before
+        // *** End of File are chunk body lines (empty context lines) and stay.
+        if (!lastChunk.eof) {
+          while (lastChunk.body.length > 0 && blank(lastChunk.body[lastChunk.body.length - 1]!)) lastChunk.body.pop();
+        }
       }
       for (const ch of chunks) {
         const parsed = bodyToON(ch.body);
@@ -831,7 +860,7 @@ function v4aUpdateEdit(path: string, moveTo: string | null, chunks: V4aChunk[], 
     if (moveTo !== null && !safe(moveTo)) throw new Fail('unsafe', moveTo);
     const before = tree.get(path);
     if (before === null) throw new Fail('missing', path);
-    if (moveTo !== null && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
+    if (moveTo !== null && tree.exists(moveTo)) throw new Fail('exists', moveTo);
     const st = fileState(before);
     let lines = st.lines;
     let cursor = 0;
