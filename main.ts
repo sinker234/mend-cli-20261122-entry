@@ -64,6 +64,12 @@ class Tree {
   }
   exists(p: string): boolean {
     if (this.now.has(p)) return this.now.get(p) !== null;
+    // A directory implied by a live in-memory path exists too: creating d/x
+    // makes d an existing path, so a later move onto d must report
+    // `error: exists d` instead of crashing in mkdir at write time.
+    for (const [k, v] of this.now) {
+      if (v !== null && k.startsWith(p + '/')) return true;
+    }
     try {
       statSync(p);
       return true;
@@ -495,6 +501,10 @@ function sectionEdit(sec: Section, strict: boolean): Edit {
   const isCreate = oldPath === null || sec.isCreate;
   const isDelete = newPath === null || sec.isDelete;
   if (oldPath === null && newPath === null) return () => {};
+  // A flag-driven create/delete whose target path is /dev/null (null) is a
+  // contradictory patch; it must never reach safe(null) and throw. No-op.
+  if (isCreate && newPath === null) return () => {};
+  if (isDelete && oldPath === null) return () => {};
   if (isCreate) {
     const newP = newPath!;
     const plusLines: string[] = [];
@@ -755,9 +765,10 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
       // Blank lines seen before the first chunk: held, not dropped — per SPEC 8
       // they are empty context lines of the first chunk, flushed into its body
       // when real chunk content arrives. They belong to no chunk when what
-      // follows shows that (*** Move to: as the section's first line, an @@
-      // chunk whose body starts after its header, or the end of the section),
-      // so they are discarded there instead.
+      // follows shows that (*** Move to: as the section's first line, or the
+      // end of the section), so they are discarded there instead. Before an
+      // @@ they become the first chunk's body (SPEC-literal: the blank line
+      // starts the first chunk; the @@ starts the second).
       let pendingBlanks: string[] = [];
       while (i < last) {
         const cl = lines[i]!;
@@ -771,7 +782,21 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
         }
         if (cl.startsWith('*** Move to: ')) throw new Exit2(`error: parse ${i + 1}`);
         if (isV4aEndOfFile(cl)) {
-          if (cur === null) throw new Exit2(`error: parse ${i + 1}`);
+          if (cur === null) {
+            // A blank line before *** End of File is a body line of the first
+            // chunk (SPEC 8: an empty line is an empty context line); a chunk
+            // made only of it still ends the file here.
+            if (pendingBlanks.length > 0 && chunks.length === 0) {
+              cur = { anchor: null, eof: true, body: [...pendingBlanks], O: [], N: [] };
+              chunks.push(cur);
+              pendingBlanks = [];
+              cur = null;
+              seenContent = true;
+              i++;
+              continue;
+            }
+            throw new Exit2(`error: parse ${i + 1}`);
+          }
           cur.eof = true;
           cur = null;
           seenContent = true;
@@ -780,7 +805,12 @@ function parseV4a(lines: string[], strict: boolean): Edit[] {
         }
         if (cl.startsWith('@@')) {
           const anchor = cl.slice(2).trim();
-          pendingBlanks = [];
+          // SPEC-literal: a blank line before the first @@ starts the first
+          // chunk (O=[''], N=['']); the @@ starts the second chunk.
+          if (pendingBlanks.length > 0 && chunks.length === 0) {
+            chunks.push({ anchor: null, eof: false, body: [...pendingBlanks], O: [], N: [] });
+            pendingBlanks = [];
+          }
           cur = { anchor: anchor === '' ? null : anchor, eof: false, body: [], O: [], N: [] };
           chunks.push(cur);
           seenContent = true;
@@ -978,16 +1008,38 @@ function run(args: string[]): { code: number; out: string[] } {
     rows.push({ key: p, line: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
   }
   rows.sort((a, b) => Buffer.compare(Buffer.from(a.key), Buffer.from(b.key)));
+  // Validate the final tree is representable before touching disk: no live
+  // file may sit where a directory is needed (an ancestor of another live
+  // file). Without this, mkdirSync can throw mid-write (EEXIST) and leave a
+  // half-written tree. A conflict is a clean `error: exists` failure.
+  for (const [p, v] of tree.now) {
+    if (v === null) continue;
+    const parts = p.split('/');
+    for (let k = 1; k < parts.length; k++) {
+      const anc = parts.slice(0, k).join('/');
+      const ancState = tree.now.has(anc) ? tree.now.get(anc)! : tree.original(anc);
+      if (ancState !== null) {
+        return { code: 1, out: [`error: exists ${anc}`, `failed: 1 of ${edits.length} edits`] };
+      }
+    }
+  }
   if (!check) {
-    for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
+    // Deletes first, then writes: a deleted file must be gone before a file
+    // is created where its directory was (and vice versa), so no step can
+    // throw on a path the other step was about to clear.
+    const keys = [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
+    for (const p of keys) {
       const was = tree.original(p);
       const now = tree.now.get(p)!;
-      if (was === now) continue;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
-      }
+      if (was === now || now !== null) continue;
+      rmSync(p, { force: true });
+    }
+    for (const p of keys) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now || now === null) continue;
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, now);
     }
   }
   const out = rows.map((r) => r.line);
